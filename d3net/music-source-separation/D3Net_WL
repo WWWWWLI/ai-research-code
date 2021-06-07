@@ -1,0 +1,398 @@
+import torch
+import torch.nn as nn
+import torchaudio.transforms
+from torch.nn.functional import pad
+from torch.nn.modules.utils import _pair
+import copy
+import os
+from thop import profile
+from thop import clever_format
+from initmodel import normal_init, constant_init
+
+
+class MultidilatedConv(nn.Module):
+    '''
+    The proposed Multidilated convolution in ‘Densely connected multidilated convolutional networks for dense prediction tasks’
+    stride == 1
+    arxiv: https://arxiv.org/pdf/2011.11844.pdf
+    Input [y0, y1, ... ,yl-1] channels refer to in_channels (list)
+    '''
+
+    def __init__(self, num_features, out_channels, kernel_size=(3, 3)):
+        super(MultidilatedConv, self).__init__()
+        assert type(num_features) is list, "`in_channels` must be type of list."
+        self.num_features = copy.deepcopy(num_features)
+        self.out_channel = out_channels
+        self.kernel_size = kernel_size
+        self.dilations = []
+        self.norm = nn.BatchNorm2d(sum(self.num_features))
+        self.ReLU = nn.ReLU()
+        self.conv2ds = nn.ModuleList()
+        for idx in range(len(self.num_features)):
+            dilation = 2 ** idx
+            self.dilations.append(dilation)
+            self.conv2ds.append(
+                nn.Conv2d(self.num_features[idx], out_channels=out_channels, kernel_size=kernel_size, stride=(1, 1),
+                          padding=dilation * (kernel_size - 1) // 2, dilation=dilation)
+            )
+
+    def forward(self, x):
+        assert x.size()[1] == sum(self.num_features), 'sum(self.num_features):{} must equal of input channels:{}' \
+            .format(sum(self.num_features), x.size()[1])
+        x = self.norm(x)
+        x = self.ReLU(x)
+        output = torch.zeros((x.size()[0], self.out_channel, x.size()[2], x.size()[3])).cuda()
+        x_split = torch.split(x, self.num_features, dim=1)
+        for idx in range(len(self.num_features)):
+            output = output + self.conv2ds[idx](x_split[idx])
+        return output
+
+
+class D2Block(nn.Module):
+    def __init__(self, in_channels, growth_rate, depth):
+        super(D2Block, self).__init__()
+        self.in_channels = in_channels
+        self.depth = depth
+        # self.growth_rate = [growth_rate] * depth
+        self.growth_rate = growth_rate
+        self.num_features = []
+        if self.in_channels > 4 * self.growth_rate:
+            self.bottleneck = nn.Conv2d(self.in_channels, out_channels=4 * growth_rate, kernel_size=(1, 1),
+                                        stride=(1, 1))
+            self.num_features.append(4 * self.growth_rate)
+        else:
+            self.bottleneck = nn.Sequential()
+            self.num_features.append(self.in_channels)
+        self.multidilatedconvs = nn.ModuleList()
+
+        for idx in range(self.depth):
+            if idx == 0:
+                pass
+            else:
+                self.num_features.append(self.growth_rate)
+            self.multidilatedconvs.append(MultidilatedConv(self.num_features, self.growth_rate))
+
+        # self.out_channels = sum(num_features)
+        # print(self.multidilatedconvs)
+
+    def forward(self, x):
+        x = self.bottleneck(x)
+        stacked = []
+        input = x
+        stacked.append(x)
+        for idx in range(self.depth):
+            if idx != 0:
+                input = torch.cat(stacked, dim=1)
+            input = self.multidilatedconvs[idx](input)
+            stacked.append(input)
+        output = torch.cat(stacked, dim=1)
+        return output
+
+
+class D3Block(nn.Module):
+    def __init__(self, in_channels, growth_rate, depth, num_d2blocks):
+        super(D3Block, self).__init__()
+        self.in_channels = in_channels
+        self.num_d2blocks = num_d2blocks
+        self.d2blocks = nn.ModuleList()
+        self.growth_rate = growth_rate
+        self.depth = depth
+
+        for idx in range(self.num_d2blocks):
+            self.d2blocks.append(D2Block(self.in_channels, self.growth_rate, self.depth))
+            if self.in_channels > 4 * self.growth_rate:
+                self.in_channels = self.in_channels + 4 * self.growth_rate + self.depth * self.growth_rate
+            else:
+                self.in_channels = self.in_channels + self.in_channels + self.depth * self.growth_rate
+
+        # print(self.d2blocks)
+
+    def forward(self, x):
+        stacked = []
+        input = x
+        stacked.append(x)
+        for idx in range(self.num_d2blocks):
+            if idx != 0:
+                input = torch.cat(stacked, dim=1)
+            input = self.d2blocks[idx](input)
+            stacked.append(input)
+        output = torch.cat(stacked[-2:], dim=1)
+        return output
+
+
+class D3Net_vocals_other(nn.Module):
+    def __init__(self):
+        super(D3Net_vocals_other, self).__init__()
+        self.spectrogram = torchaudio.transforms.Spectrogram(n_fft=4096, hop_length=4096 // 4)
+
+        # low
+        self.conv_low = nn.Conv2d(2, 32, (3, 3), padding=(1, 1))
+        self.D3Block1_low = D3Block(32, 16, 5, 2)
+
+        self.downsample2_low = nn.AvgPool2d(2, 2)
+        self.D3Block2_low = D3Block(256, 18, 5, 2)
+
+        self.downsample3_low = nn.AvgPool2d(2, 2)
+        self.D3Block3_low = D3Block(324, 20, 5, 2)
+
+        self.downsample4_low = nn.AvgPool2d(2, 2)
+        self.D3Block4_low = D3Block(360, 22, 5, 2)
+
+        self.downsample5_low = nn.AvgPool2d(2, 2)
+
+        self.upsample6_low = nn.ConvTranspose2d(396, 396, (2, 2), stride=(2, 2))
+
+        self.upsample7_low = nn.ConvTranspose2d(396, 396, (2, 2), stride=(2, 2))
+        self.D3Block7_low = D3Block(396 + 360, 20, 4, 2)
+
+        self.upsample8_low = nn.ConvTranspose2d(320, 320, (2, 2), stride=(2, 2))
+        self.D3Block8_low = D3Block(320 + 324, 18, 4, 2)
+
+        self.upsample9_low = nn.ConvTranspose2d(288, 288, (2, 2), stride=(2, 2))
+        self.D3Block9_low = D3Block(288 + 256, 16, 4, 2)
+        # low
+
+        # high
+        self.conv_high = nn.Conv2d(2, 8, (3, 3), padding=(1, 1))
+        self.D3Block1_high = D3Block(8, 2, 1, 1)
+
+        self.downsample2_high = nn.AvgPool2d(2, 2)
+        self.D3Block2_high = D3Block(18, 2, 1, 1)
+
+        self.downsample3_high = nn.AvgPool2d(2, 2)
+        self.D3Block3_high = D3Block(28, 2, 1, 1)
+
+        self.downsample4_high = nn.AvgPool2d(2, 2)
+        self.D3Block4_high = D3Block(38, 2, 1, 1)
+
+        self.downsample5_high = nn.AvgPool2d(2, 2)
+
+        self.upsample6_high = nn.ConvTranspose2d(48, 48, (2, 2), stride=(2, 2))
+
+        self.upsample7_high = nn.ConvTranspose2d(48, 48, (2, 2), stride=(2, 2))
+        self.D3Block7_high = D3Block(48 + 38, 2, 1, 1)
+
+        self.upsample8_high = nn.ConvTranspose2d(96, 96, (2, 2), stride=(2, 2))
+        self.D3Block8_high = D3Block(96 + 28, 2, 1, 1)
+
+        self.upsample9_high = nn.ConvTranspose2d(134, 134, (2, 2), stride=(2, 2))
+        self.D3Block9_high = D3Block(134 + 18, 2, 1, 1)
+
+        self.concat_high_low = nn.Conv2d(162, 256, (1, 1))
+        # high
+
+        # full
+        self.conv_full = nn.Conv2d(2, 32, (3, 3), padding=(1, 1))
+        self.D3Block1_full = D3Block(32, 13, 4, 2)
+
+        self.downsample2_full = nn.AvgPool2d(2, 2)
+        self.D3Block2_full = D3Block(188, 14, 5, 2)
+
+        self.downsample3_full = nn.AvgPool2d(2, 2)
+        self.D3Block3_full = D3Block(252, 15, 6, 2)
+
+        self.downsample4_full = nn.AvgPool2d(2, 2)
+        self.D3Block4_full = D3Block(300, 16, 7, 2)
+
+        self.downsample5_full = nn.AvgPool2d(2, 2)
+        self.D3Block5_full = D3Block(352, 17, 8, 2)
+
+        self.upsample6_full = nn.ConvTranspose2d(408, 408, (2, 2), stride=(2, 2))
+        self.D3Block6_full = D3Block(408 + 352, 16, 6, 2)
+
+        self.upsample7_full = nn.ConvTranspose2d(320, 320, (2, 2), stride=(2, 2))
+        self.D3Block7_full = D3Block(320 + 300, 14, 5, 2)
+
+        self.upsample8_full = nn.ConvTranspose2d(252, 252, (2, 2), stride=(2, 2))
+        self.D3Block8_full = D3Block(252 + 252, 12, 4, 2)
+
+        self.upsample9_full = nn.ConvTranspose2d(192, 192, (2, 2), stride=(2, 2))
+        self.D3Block9_full = D3Block(192 + 188, 11, 4, 2)
+        # full
+
+        self.D2Block = D2Block(256 + 176, 12, 3)
+
+        self.gating = nn.Conv2d(84, 2, (3, 3), (1, 1), (1, 1))
+        self.feature = nn.Conv2d(84, 2, (3, 3), (1, 1), (1, 1))
+
+        self.init_weights()
+
+    def forward(self, x):
+        # low
+        x_low = torch.split(x, 256, dim=3)[0]
+
+        x_low = self.conv_low(x_low)
+        x_low = self.D3Block1_low(x_low)
+        x_low_D3Block1 = x_low
+
+        x_low = self.downsample2_low(x_low)
+        x_low = self.D3Block2_low(x_low)
+        x_low_D3Block2 = x_low
+
+        x_low = self.downsample3_low(x_low)
+        x_low = self.D3Block3_low(x_low)  # 972
+        # print("out put low d3block 3:{}".format(x_low.size()))
+        x_low_D3Block3 = x_low
+
+        x_low = self.downsample4_low(x_low)
+        x_low = self.D3Block4_low(x_low)
+
+        x_low = self.downsample5_low(x_low)
+
+        x_low = self.upsample6_low(x_low)
+
+        x_low = self.upsample7_low(x_low)
+        # print("out put upsample7_low :{}".format(x_low.size()))
+        x_low = torch.cat([x_low_D3Block3, x_low], 1)
+        x_low = self.D3Block7_low(x_low)
+
+        x_low = self.upsample8_low(x_low)
+        x_low = torch.cat([x_low_D3Block2, x_low], 1)
+        x_low = self.D3Block8_low(x_low)
+
+        x_low = self.upsample9_low(x_low)
+        x_low = torch.cat([x_low_D3Block1, x_low], 1)
+        x_low = self.D3Block9_low(x_low)
+        # low
+
+        # high
+        x_high = torch.split(x, [256, 1344], dim=3)[1]
+        x_high = self.conv_high(x_high)
+        x_high = self.D3Block1_high(x_high)
+        x_high_D3Block1 = x_high
+
+        x_high = self.downsample2_high(x_high)
+        x_high = self.D3Block2_high(x_high)
+        x_high_D3Block2 = x_high
+
+        x_high = self.downsample3_high(x_high)
+        x_high = self.D3Block3_high(x_high)
+        x_high_D3Block3 = x_high
+
+        x_high = self.downsample4_high(x_high)
+        x_high = self.D3Block4_high(x_high)
+
+        x_high = self.downsample5_high(x_high)
+
+        x_high = self.upsample6_high(x_high)
+
+        x_high = self.upsample7_high(x_high)
+        x_high = torch.cat([x_high_D3Block3, x_high], 1)
+        x_high = self.D3Block7_high(x_high)
+
+        x_high = self.upsample8_high(x_high)
+        x_high = torch.cat([x_high_D3Block2, x_high], 1)
+        x_high = self.D3Block8_high(x_high)
+
+        x_high = self.upsample9_high(x_high)
+        x_high = torch.cat([x_high_D3Block1, x_high], 1)
+        x_high = self.D3Block9_high(x_high)
+        x_high = self.concat_high_low(x_high)
+        # high
+
+        # full
+        x_full = x
+
+        x_full = self.conv_full(x_full)
+        x_full = self.D3Block1_full(x_full)
+        x_full_D3Block1 = x_full
+
+        x_full = self.downsample2_full(x_full)
+        x_full = self.D3Block2_full(x_full)
+        x_full_D3Block2 = x_full
+
+        x_full = self.downsample3_full(x_full)
+        x_full = self.D3Block3_full(x_full)
+        x_full_D3Block3 = x_full
+
+        x_full = self.downsample4_full(x_full)
+        x_full = self.D3Block4_full(x_full)
+        x_full_D3Block4 = x_full
+
+        x_full = self.downsample5_full(x_full)
+        x_full = self.D3Block5_full(x_full)
+
+        x_full = self.upsample6_full(x_full)
+        x_full = torch.cat([x_full_D3Block4, x_full], 1)
+        x_full = self.D3Block6_full(x_full)
+
+        x_full = self.upsample7_full(x_full)
+        x_full = torch.cat([x_full_D3Block3, x_full], 1)
+        x_full = self.D3Block7_full(x_full)
+
+        x_full = self.upsample8_full(x_full)
+        x_full = torch.cat([x_full_D3Block2, x_full], 1)
+        x_full = self.D3Block8_full(x_full)
+
+        x_full = self.upsample9_full(x_full)
+        x_full = torch.cat([x_full_D3Block1, x_full], 1)
+        x_full = self.D3Block9_full(x_full)
+        # full
+
+        # concat high and low
+        x = torch.cat([x_low, x_high], dim=3)
+
+        x = torch.cat([x, x_full], dim=1)
+
+        x = self.D2Block(x)
+
+        x = torch.mul(torch.sigmoid(self.gating(x)), self.feature(x))
+
+        return x
+
+    def init_weights(self):
+        print('[Message] Init models.')
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm1d):
+                constant_init(m, 1)
+            elif isinstance(m, nn.BatchNorm2d):
+                constant_init(m, 1)
+            elif isinstance(m, nn.Conv2d):
+                normal_init(m, std=0.01)
+            elif isinstance(m, nn.Linear):
+                normal_init(m, std=0.01)
+            elif isinstance(m, nn.Conv1d):
+                normal_init(m, std=0.01)
+
+
+def test_MultidilatedConv():
+    x = torch.randn((4, 20, 128, 101))
+    conv2d = MultidilatedConv([5, 5, 5, 5], 32)
+    print(conv2d)
+    output = conv2d(x)
+    print(output.size())
+
+
+def test_D2Block():
+    x = torch.randn((2, 20, 8, 8))
+    d2block = D2Block(20, 2, 3)
+    output = d2block(x)
+    print(output.size())
+
+
+def test_D3Block():
+    channels = 612
+    x = torch.randn((2, channels, 8, 8))
+    d3block = D3Block(channels, 20, 5, 2)
+    output = d3block(x)
+    print(output.size())
+
+
+def test_D3Net():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    d3net = D3Net_vocals_other()
+    d3net.to(device)
+    x = torch.randn((1, 2, 256, 1600)).to(device)
+    # x = torch.randn((1, 2, 256, 2049))
+    output = d3net(x)
+    print(output.size())
+
+    flops, params = profile(d3net, inputs=(x,))
+    flops, params = clever_format([flops, params], "%.3f")
+    print('flops:{}'.format(flops))
+    print('params:{}'.format(params))
+
+
+if __name__ == '__main__':
+    test_D3Net()
